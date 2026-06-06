@@ -25,8 +25,8 @@ _stable_sort_general :: proc(data: $T/[]$E, call: $P, $KIND: Sort_Kind) where (O
 			#panic("unhandled Sort_Kind")
 		}
 	}
-	if len(arr) < 1000 {
-		insertion_sort(arr, call)
+	if len(data) < 1000 {
+		insertion_sort(data, call)
 		return
 	}
 	rotate_merge(data, call)
@@ -97,7 +97,7 @@ _stable_sort_general :: proc(data: $T/[]$E, call: $P, $KIND: Sort_Kind) where (O
 		}
 		if left + right == 2 {
 			if less(arr[1],arr[0],call) {
-				slice.swap(arr,0,1)
+				swap(arr,0,1)
 			}
 			return
 		} 
@@ -117,7 +117,7 @@ _stable_sort_general :: proc(data: $T/[]$E, call: $P, $KIND: Sort_Kind) where (O
 			left2 = first_cut
 		}
 		
-		slice.rotate_left(arr[first_cut:second_cut], left - first_cut)
+		rotate_left(arr[first_cut:second_cut], left - first_cut)
 		new_mid := first_cut + right2
 
 		stable_merge(arr[:new_mid], left2, 		right2,		  call)
