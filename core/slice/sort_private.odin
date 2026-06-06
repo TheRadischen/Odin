@@ -91,7 +91,7 @@ _stable_sort_general :: proc(data: $T/[]$E, call: $P, $KIND: Sort_Kind) where (O
 
 		return from
 	}
-	stable_merge :: proc(arr: $T/[]$E, left, right: int, call: $P) {
+	stable_merge :: proc(arr: $T/[]$E, left, right: int, call: $P) #no_bounds_check {
 		if left == 0 || right == 0 {
 			return
 		}
