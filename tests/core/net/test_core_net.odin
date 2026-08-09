@@ -139,6 +139,13 @@ IP_Address_Parsing_Test_Vectors :: []IP_Address_Parsing_Test_Vector{
 	{ .IP4, "[10.0.128.31] :80",       "", ""},
 	{ .IP4, "[255.255.255.255]:65536", "", ""},
 
+	// "]:" with no opening '[' is not a bracketed host:port; it parses
+	// as a plain host (no port) and so is not a valid address here.
+	{ .IP4, "]:80",                    "", ""},
+	{ .IP4, "]:",                      "", ""},
+	{ .IP6, "]:1",                     "", ""},
+	{ .IP4, "foo]:80",                 "", ""},
+
 
 	// numbers-and-dots notation, but not dotted-decimal
 	{ .IP4_Alt, "1.2.03.4",                "01020304", ""},
@@ -515,6 +522,36 @@ join_url_test :: proc(t: ^testing.T) {
 			pass |= url == test_url
 		}
 		testing.expectf(t, pass, "Expected `net.join_url` to return one of %s, got %s", test.url, url)
+	}
+}
+
+@test
+percent_encode_test :: proc(t: ^testing.T) {
+	test_cases := []struct{input, expected: string} {
+		// Bytes < 0x10 must be zero-padded to two hex digits
+		{"\n",   "%0A"},
+		{"\t",   "%09"},
+		{"\r",   "%0D"},
+		{"a\nb", "a%0Ab"},
+		{"\x00", "%00"},
+
+		// Bytes >= 0x10
+		{" ",    "%20"},
+		{"😃",   "%F0%9F%98%83"},
+
+		// Unreserved characters pass through unescaped
+		{"AZaz09-_.~", "AZaz09-_.~"},
+	}
+
+	for test in test_cases {
+		encoded := net.percent_encode(test.input)
+		defer delete(encoded)
+		testing.expectf(t, encoded == test.expected, "Expected `net.percent_encode(%q)` to return %q, got %q", test.input, test.expected, encoded)
+
+		decoded, ok := net.percent_decode(encoded)
+		defer delete(decoded)
+		testing.expectf(t, ok, "Expected `net.percent_decode(%q)` to succeed", encoded)
+		testing.expectf(t, decoded == test.input, "Expected percent-encoding roundtrip for %q, got %q", test.input, decoded)
 	}
 }
 

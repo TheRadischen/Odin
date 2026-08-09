@@ -60,6 +60,8 @@ gb_global BuiltinTypeIsProc *builtin_type_is_procs[BuiltinProc__type_simple_bool
 	is_type_raw_union,
 	is_type_fixed_capacity_dynamic_array,
 
+	is_type_internally_pointer_like,
+
 	is_type_polymorphic_record_specialized,
 	is_type_polymorphic_record_unspecialized,
 
@@ -763,8 +765,10 @@ gb_internal bool check_builtin_c_procedure(CheckerContext *c, Operand *operand, 
 			return false;
 		}
 
+		c->allow_c_vararg_param = true;
 		Operand args = {};
 		check_expr(c, &args, ce->args[1]);
+		c->allow_c_vararg_param = false;
 		if (list.mode == Addressing_Invalid) {
 			return false;
 		}
@@ -2443,7 +2447,7 @@ gb_internal bool check_builtin_procedure_directive(CheckerContext *c, Operand *o
 			} else {
 				Operand o = {};
 				Entity *e = check_ident(c, &o, arg, nullptr, nullptr, true);
-				if (e == nullptr || (e->flags & EntityFlag_Param) == 0) {
+				if (e == nullptr || (e->kind != Entity_Procedure && (e->flags & EntityFlag_Param) == 0)) {
 					error(arg, "'#caller_expression' expected a valid earlier parameter name");
 				}
 				arg->Ident.entity = e;
@@ -5278,6 +5282,62 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 		break;
 	}
 
+	case BuiltinProc_soa_copy_from_slice: {
+		Operand array_ptr = {};
+		Operand offset    = {};
+		Operand args      = {};
+		check_expr(c, &array_ptr, ce->args[0]);
+		if (array_ptr.mode == Addressing_Invalid) {
+			return false;
+		}
+		if (!is_type_pointer(array_ptr.type)) {
+			gbString s = type_to_string(array_ptr.type);
+			error(array_ptr.expr, "Expected a pointer to a #soa dynamic array, got %s", s);
+			gb_string_free(s);
+			return false;
+		}
+		Type *array_type = type_deref(array_ptr.type);
+		if (!is_type_soa_dynamic_array(array_type)) {
+			gbString s = type_to_string(array_ptr.type);
+			error(array_ptr.expr, "Expected a pointer to a #soa dynamic array, got %s", s);
+			gb_string_free(s);
+			return false;
+		}
+		Type *at = base_type(array_type);
+		GB_ASSERT(at->kind == Type_Struct);
+		Type *elem = at->Struct.soa_elem;
+
+		check_expr_with_type_hint(c, &offset, ce->args[1], t_int);
+		if (offset.mode == Addressing_Invalid) {
+			return false;
+		}
+		if (!is_type_integer(offset.type)) {
+			gbString s = type_to_string(array_ptr.type);
+			error(array_ptr.expr, "Expected an integer as the offset for '%.*s', got %s", s, LIT(builtin_name));
+			gb_string_free(s);
+			return false;
+		}
+
+		Type *slice_hint = alloc_type_slice(elem);
+
+		check_expr_with_type_hint(c, &args, ce->args[2], slice_hint);
+		if (args.mode == Addressing_Invalid) {
+			return false;
+		}
+		if (!are_types_identical(base_type(args.type), slice_hint)) {
+			gbString s = type_to_string(slice_hint);
+			gbString t = type_to_string(args.type);
+			error(array_ptr.expr, "Expected a %s to use as the slice '%.*s', got %s", s, LIT(builtin_name), t);
+			gb_string_free(t);
+			gb_string_free(s);
+			return false;
+		}
+
+		operand->mode = Addressing_NoValue;
+		operand->type = nullptr;
+		break;
+	}
+
 	case BuiltinProc_concatenate: {
 		Operand lhs = {};
 
@@ -7060,6 +7120,8 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 	case BuiltinProc_type_is_simd_vector:
 	case BuiltinProc_type_is_matrix:
 	case BuiltinProc_type_is_raw_union:
+	case BuiltinProc_type_is_fixed_capacity_dynamic_array:
+	case BuiltinProc_type_is_internally_pointer_like:
 	case BuiltinProc_type_is_specialized_polymorphic_record:
 	case BuiltinProc_type_is_unspecialized_polymorphic_record:
 	case BuiltinProc_type_has_nil:
@@ -7308,7 +7370,11 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 
 			operand->mode = Addressing_Constant;
 			operand->type = t_untyped_bool;
-			operand->value = exact_value_bool(check_type_specialization_to(c, s, t, false, false));
+			bool is_specialization = false;
+			if (!are_types_identical(s, t)) {
+				is_specialization = check_type_specialization_to(c, s, t, false, false);
+			}
+			operand->value = exact_value_bool(is_specialization);
 
 		}
 		break;
@@ -7789,6 +7855,28 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 
 		break;
 
+	case BuiltinProc_type_proc_calling_convention:
+		if (operand->mode != Addressing_Type || !is_type_proc(operand->type)) {
+			error(operand->expr, "Expected a procedure type for '%.*s'", LIT(builtin_name));
+			return false;
+		} else {
+			if (is_type_polymorphic(operand->type)) {
+				error(operand->expr, "Expected a non-polymorphic procedure type for '%.*s'", LIT(builtin_name));
+				return false;
+			}
+
+			Type *pt = base_type(operand->type);
+			GB_ASSERT(pt->kind == Type_Proc);
+			ProcCallingConvention cc = pt->Proc.calling_convention;
+
+			operand->mode  = Addressing_Constant;
+			operand->type  = t_odin_calling_convention;
+			operand->value = exact_value_i64(cc);
+		}
+
+		break;
+
+
 	case BuiltinProc_type_polymorphic_record_parameter_count:
 		operand->value = exact_value_i64(0);
 		if (operand->mode != Addressing_Type) {
@@ -8249,7 +8337,7 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 			Ast *call_expr = unparen_expr(ce->args[0]);
 			Operand op = {};
 			check_expr_base(c, &op, ce->args[0], nullptr);
-			if (op.mode != Addressing_Value && !(call_expr && call_expr->kind == Ast_CallExpr)) {
+			if (op.mode != Addressing_Value || call_expr == nullptr || call_expr->kind != Ast_CallExpr) {
 				error(ce->args[0], "Expected a call expression for '%.*s'", LIT(builtin_name));
 				return false;
 			}

@@ -1,4 +1,5 @@
 #+feature dynamic-literals
+#+feature using-stmt
 package test_core_runtime
 
 import "base:intrinsics"
@@ -229,6 +230,226 @@ test_soa_make_len :: proc(t: ^testing.T) {
 	testing.expect_value(t, array[1], [2]int{3, 4})
 }
 
+// storing an all-zero constant into a slice/dynamic #soa element
+@(test)
+test_soa_zero_elem_store :: proc(t: ^testing.T) {
+
+	V :: struct {a: u8, b: u16, c: u32, d: u64, e: u128}
+	one := V{1, 2, 3, 4, 5}
+
+	array := make(#soa[dynamic]V, 0, 8)
+	defer delete(array)
+	for _ in 0 ..< 8 {
+		append(&array, one)
+	}
+
+	array[2] = {}
+	array[5] = V{0, 0, 0, 0, 0}
+
+	s: #soa[]V = array[:]
+	s[7] = V{}
+
+	for i in 0 ..< 8 {
+		expected := one if i != 2 && i != 5 && i != 7 else V{}
+		testing.expect_value(t, array[i], expected)
+	}
+}
+
+
+V_Padded :: struct {a: i32, b: f64, c: f32}
+soa_padded_global := #soa[3]V_Padded{
+	{a = 1, b = 1.0, c = 1.0},
+	{a = 2, b = 2.0, c = 1.0},
+	{a = 3, b = 3.0, c = 1.0},
+}
+
+// fixed #soa compound literals with a padded element struct
+@(test)
+test_soa_fixed_compound_literal :: proc(t: ^testing.T) {
+	for i in 0 ..< 3 {
+		testing.expect_value(t, soa_padded_global[i], V_Padded{i32(i + 1), f64(i + 1), 1.0})
+	}
+
+	local := #soa[3]V_Padded{
+		{a = 1, b = 1.0, c = 1.0},
+		{a = 2, b = 2.0, c = 1.0},
+		{a = 3, b = 3.0, c = 1.0},
+	}
+	for i in 0 ..< 3 {
+		testing.expect_value(t, local[i], V_Padded{i32(i + 1), f64(i + 1), 1.0})
+	}
+
+	sparse := #soa[4]V_Padded{
+		0 ..= 1 = {a = 7, b = 7.0, c = 7.0},
+		3 = {a = 9, b = 9.0, c = 9.0},
+	}
+	testing.expect_value(t, sparse[0], V_Padded{7, 7.0, 7.0})
+	testing.expect_value(t, sparse[1], V_Padded{7, 7.0, 7.0})
+	testing.expect_value(t, sparse[2], V_Padded{})
+	testing.expect_value(t, sparse[3], V_Padded{9, 9.0, 9.0})
+}
+
+// swizzling an element of an #soa container with an array element type
+@(test)
+test_soa_array_elem_swizzle :: proc(t: ^testing.T) {
+
+	ref := [4]u16{1, 2, 3, 4} // reference
+
+	fixed: #soa[3][4]u16
+	fixed.x[0], fixed.y[0], fixed.z[0], fixed.w[0] = 90, 91, 92, 93
+	fixed.x[1], fixed.y[1], fixed.z[1], fixed.w[1] = 1, 2, 3, 4
+
+	testing.expect_value(t, fixed[1].x, ref.x)
+	testing.expect_value(t, fixed[1].xy, ref.xy)
+	testing.expect_value(t, fixed[1].xyz, ref.xyz)
+	testing.expect_value(t, fixed[1].xyzw, ref.xyzw)
+	testing.expect_value(t, fixed[1].yx, ref.yx)   // permuted
+	testing.expect_value(t, fixed[1].xx, ref.xx)   // repeated
+	testing.expect_value(t, fixed[1].wzyx, ref.wzyx)
+
+	// swizzle may repeat components and count can go > the array len
+	testing.expect_value(t, swizzle(fixed[1], 0, 1), swizzle(ref, 0, 1))
+	testing.expect_value(t, swizzle(fixed[1], 3, 0, 1), swizzle(ref, 3, 0, 1))
+	testing.expect_value(t, swizzle(fixed[1], 0, 1, 0, 1, 0), swizzle(ref, 0, 1, 0, 1, 0))
+	testing.expect_value(t, swizzle(fixed[1], 3, 3, 3, 3, 3, 3), swizzle(ref, 3, 3, 3, 3, 3, 3))
+
+	// runtime element index
+	i := 1
+	testing.expect_value(t, fixed[i].xy, ref.xy)
+
+	// scatter writes
+	fixed[1].xy = [2]u16{10, 11}
+	testing.expect_value(t, fixed.x[1], 10)
+	testing.expect_value(t, fixed.y[1], 11)
+	testing.expect_value(t, fixed.z[1], 3)
+	// scatter writes permuted
+	fixed[1].yx = [2]u16{20, 21}
+	testing.expect_value(t, fixed.y[1], 20)
+	testing.expect_value(t, fixed.x[1], 21)
+	testing.expect_value(t, fixed.x[0], 90)
+	testing.expect_value(t, fixed.w[0], 93)
+
+	// dynamic and slice kinds
+	dyn := make(#soa[dynamic][4]u16, 2)
+	defer delete(dyn)
+	dyn[0] = [4]u16{1, 2, 3, 4}
+	dyn[1] = [4]u16{5, 6, 7, 8}
+
+	testing.expect_value(t, dyn[0].xy, ref.xy)
+	testing.expect_value(t, dyn[0].zx, ref.zx)
+	dyn[1].xy = [2]u16{40, 41}
+	testing.expect_value(t, dyn.x[1], 40)
+	testing.expect_value(t, dyn.y[1], 41)
+	testing.expect_value(t, dyn.x[0], 1)
+
+	s := dyn[:]
+	testing.expect_value(t, s[0].zw, ref.zw)
+	s[0].zw = [2]u16{50, 51}
+	testing.expect_value(t, dyn.z[0], 50)
+	testing.expect_value(t, dyn.w[0], 51)
+
+	// through #soa pointer
+	p := &dyn[0]
+	testing.expect_value(t, p^.x, u16(1))
+	testing.expect_value(t, p^.xy, [2]u16{1, 2})
+	
+	// auto-deref through the #soa pointer
+	testing.expect_value(t, p.x, u16(1))
+	testing.expect_value(t, p.xy, [2]u16{1, 2})
+	testing.expect_value(t, p.yx, [2]u16{2, 1})
+	p.zw = [2]u16{60, 61}
+	testing.expect_value(t, dyn.z[0], 60)
+	testing.expect_value(t, dyn.w[0], 61)
+	p.xy += [2]u16{1, 1}
+	testing.expect_value(t, dyn.x[0], 2)
+	testing.expect_value(t, dyn.y[0], 3)
+
+	// read-modify-write
+	fixed[1].xy += [2]u16{9, 10}
+	testing.expect_value(t, fixed.x[1], 30)
+	testing.expect_value(t, fixed.y[1], 30)
+	fixed[1].xx += [2]u16{5, 100}
+	testing.expect_value(t, fixed.x[1], 35)
+
+	// range over an element swizzle
+	sum: u16
+	for c in fixed[1].wz {
+		sum += c
+	}
+	testing.expect_value(t, sum, u16(7))
+
+	// shuffle
+	fixed[1].xy = [2]u16{9, 10}
+	fixed[1].xy = fixed[1].yx
+	testing.expect_value(t, fixed[1].xy, [2]u16{10, 9})
+}
+
+// "using" on an #soa for-in looping variable
+@(test)
+test_soa_for_in_using :: proc(t: ^testing.T) {
+	S :: struct {
+		a: int,
+		b: int,
+		c: int,
+	}
+	s: #soa[2]S = {{a = 1, b = 2, c = 3}, {a = 4, b = 5, c = 6}}
+
+	sum := 0
+	for v in s {
+		using v
+		sum += a + c
+	}
+	testing.expect_value(t, sum, 14)
+
+	for &v in s {
+		using v
+		b += 10
+	}
+	testing.expect_value(t, s.b[0], 12)
+	testing.expect_value(t, s.b[1], 15)
+}
+
+// &v in for-in over soa container
+@(test)
+test_soa_for_in_addr :: proc(t: ^testing.T) {
+	S :: struct {
+		a: int,
+		b: int,
+	}
+	s: #soa[2]S = {{a = 1, b = 2}, {a = 3, b = 4}}
+
+	for &v, i in s {
+		p := &v
+		testing.expect_value(t, p.a, s.a[i])
+		p.b += 10 * (i + 1)
+	}
+	testing.expect_value(t, s.b[0], 12)
+	testing.expect_value(t, s.b[1], 24)
+
+	// &v is the same type as &s[i]
+	q := &s[0]
+	for &v in s {
+		q = &v
+	}
+
+	// still valid
+	testing.expect_value(t, q.a, 3)
+	q.a = 30
+	testing.expect_value(t, s.a[1], 30)
+
+	// array element type
+	arr: #soa[2][4]u16
+	arr[1] = [4]u16{1, 2, 3, 4}
+	for &v, i in arr {
+		pv := &v
+		if i == 1 {
+			testing.expect_value(t, pv.x, u16(1))
+			pv.y = 20
+		}
+	}
+	testing.expect_value(t, arr.y[1], 20)
+}
+
 @(test)
 test_soa_array_allocator_resize :: proc(t: ^testing.T) {
 
@@ -424,4 +645,197 @@ test_memory_compare_zero :: proc(t: ^testing.T) {
 			subdata[idx] = 0
 		}
 	}
+}
+
+// Runs identical append/inject/remove sequences for a #soa[dynamic] array
+// and an AoS [dynamic] reference, comparing all elements after each
+// stage. Covers appends, injections (interior, at the end, and past the
+// end where the gap must read as zero elements), unordered and ordered
+// removes.
+@(test)
+test_soa_array_append_inject_remove :: proc(t: ^testing.T) {
+	check :: proc(t: ^testing.T, $E: typeid, mk: proc(i: int) -> E) {
+		expect_same :: proc(t: ^testing.T, soa: #soa[dynamic]$T, model: [dynamic]T) {
+			testing.expect_value(t, len(soa), len(model))
+			for i in 0..<min(len(soa), len(model)) {
+				testing.expect_value(t, soa[i], model[i])
+			}
+		}
+
+		soa: #soa[dynamic]E
+		defer delete(soa)
+		ref: [dynamic]E
+		defer delete(ref)
+
+		// single appends
+		for i in 0..<10 {
+			n, err := append(&soa, mk(i))
+			testing.expect_value(t, n, 1)
+			testing.expect_value(t, err, nil)
+			append(&ref, mk(i))
+		}
+		expect_same(t, soa, ref)
+
+		// batch appends
+		buf: [32]E
+		for i in 0..<32 { buf[i] = mk(123 + i) }
+		BATCH_LEN :: 5
+		n, err := append(&soa, ..buf[:BATCH_LEN])
+		testing.expect_value(t, n, BATCH_LEN)
+		testing.expect_value(t, err, nil)
+		append(&ref, ..buf[:BATCH_LEN])
+		expect_same(t, soa, ref)
+
+		n, err = append(&soa, ..buf[:])
+		testing.expect_value(t, n, 32)
+		testing.expect_value(t, err, nil)
+		append(&ref, ..buf[:])
+		expect_same(t, soa, ref)
+
+		// single injections
+		ok: bool
+		ok, err = inject_at_soa(&soa, 0, mk(300))
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, 0, mk(300))
+		expect_same(t, soa, ref)
+
+		ok, err = inject_at_soa(&soa, len(soa)/2, mk(301))
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, len(ref)/2, mk(301))
+		expect_same(t, soa, ref)
+
+		// inject at the end
+		ok, err = inject_at_soa(&soa, len(soa), mk(302))
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, len(ref), mk(302))
+		expect_same(t, soa, ref)
+
+		// batch injections
+		ok, err = inject_at_soa(&soa, 3, ..buf[:BATCH_LEN])
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, 3, ..buf[:BATCH_LEN])
+		expect_same(t, soa, ref)
+
+		ok, err = inject_at_soa(&soa, len(soa), ..buf[:])
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, len(ref), ..buf[:])
+		expect_same(t, soa, ref)
+
+		// injecting nothing is a no-op
+		ok, err = inject_at_soa(&soa, 4, ..buf[:0])
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, 4, ..buf[:0])
+		expect_same(t, soa, ref)
+
+		// single injection past the end: the gap [len, index) reads as zero
+		// elements. Poison the spare capacity first (fresh heap pages are
+		// already zero, which would hide a missing gap zero), then shrink back.
+		for i in 0..<8 {
+			n, err = append(&soa, mk(900 + i))
+			testing.expect_value(t, n, 1)
+			testing.expect_value(t, err, nil)
+		}
+		testing.expect_value(t, resize_soa(&soa, len(soa) - 8), nil)
+		ok, err = inject_at_soa(&soa, len(soa) + 3, mk(500))
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, len(ref) + 3, mk(500))
+		expect_same(t, soa, ref)
+
+		// batch injection past the end (its gap slots reuse the poison above)
+		ok, err = inject_at_soa(&soa, len(soa) + 2, ..buf[:BATCH_LEN])
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, len(ref) + 2, ..buf[:BATCH_LEN])
+		expect_same(t, soa, ref)
+
+		// unordered removes
+		unordered_remove_soa(&soa, 20)
+		unordered_remove(&ref, 20)
+		unordered_remove_soa(&soa, 0)
+		unordered_remove(&ref, 0)
+		unordered_remove_soa(&soa, len(soa)-1)
+		unordered_remove(&ref, len(ref)-1)
+		expect_same(t, soa, ref)
+
+		// ordered removes
+		ordered_remove_soa(&soa, 17)
+		ordered_remove(&ref, 17)
+		ordered_remove_soa(&soa, 0)
+		ordered_remove(&ref, 0)
+		ordered_remove_soa(&soa, len(soa)-1)
+		ordered_remove(&ref, len(ref)-1)
+		expect_same(t, soa, ref)
+
+		// interleaved removes, appends and injections
+		for i in 0..<8 {
+			unordered_remove_soa(&soa, i)
+			unordered_remove(&ref, i)
+			n, err = append(&soa, mk(200 + i))
+			testing.expect_value(t, n, 1)
+			testing.expect_value(t, err, nil)
+			append(&ref, mk(200 + i))
+			ok, err = inject_at_soa(&soa, i, mk(400 + i))
+			testing.expect(t, ok)
+			testing.expect_value(t, err, nil)
+			inject_at(&ref, i, mk(400 + i))
+		}
+		expect_same(t, soa, ref)
+
+		// remove till empty, then reuse
+		for len(soa) > 0 {
+			unordered_remove_soa(&soa, 0)
+			unordered_remove(&ref, 0)
+		}
+		testing.expect_value(t, len(soa), 0)
+
+		// inject into an empty array
+		ok, err = inject_at_soa(&soa, 0, mk(998))
+		testing.expect(t, ok)
+		testing.expect_value(t, err, nil)
+		inject_at(&ref, 0, mk(998))
+		expect_same(t, soa, ref)
+
+		// non-zero append
+		n, err = non_zero_append(&soa, mk(42))
+		testing.expect_value(t, n, 1)
+		testing.expect_value(t, err, nil)
+		non_zero_append(&ref, mk(42))
+		expect_same(t, soa, ref)
+	}
+
+	// mixed field widths + padding
+	Padded :: struct { a: u8, b: u64, c: u16 }
+	check(t, Padded, proc(i: int) -> Padded { return {u8(i*3), u64(i)*257 + 7, u16(i*5 + 1)} })
+	// array element type
+	check(t, [4]u16, proc(i: int) -> [4]u16 { return {u16(i), u16(i + 1), u16(i*3), u16(i*7)} })
+	// eight fields at varying widths, no two neighbouring fields share a stride
+	Eight :: struct { a: u8, b: u16, c: u32, d: u64, e: i8, f: i16, g: f32, h: f64 }
+	check(t, Eight, proc(i: int) -> Eight {
+		return {
+			u8(i), u16(i*3 + 1), u32(i)*5 + 2, u64(i)*7 + 3,
+			i8(i >> 1), i16(i*11 + 4), f32(i)*1.5, f64(i)*2.25,
+		}
+	})
+	// #packed struct with > 16 fields, field offsets diverging from default
+	// layout (u8/u64 alternate, align_of == 1), and the field count takes
+	// the type-erased batch appends compile time branch.
+	Packed17 :: struct #packed {
+		f0: u8, f1: u64, f2: u8, f3: u64, f4: u8, f5: u64, f6: u8, f7: u64,
+		f8: u8, f9: u64, f10: u8, f11: u64, f12: u8, f13: u64, f14: u8, f15: u64,
+		f16: u8,
+	}
+	check(t, Packed17, proc(i: int) -> Packed17 {
+		return {
+			u8(i), u64(i)*3 + 1, u8(i >> 1), u64(i)*5 + 2, u8(i >> 2), u64(i)*7 + 3, u8(i >> 3), u64(i)*11 + 4,
+			u8(i >> 4), u64(i)*13 + 5, u8(i >> 5), u64(i)*17 + 6, u8(i >> 6), u64(i)*19 + 7, u8(i >> 7), u64(i)*23 + 8,
+			u8(i*3),
+		}
+	})
 }

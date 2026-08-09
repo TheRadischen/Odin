@@ -1348,6 +1348,7 @@ gb_internal void lb_build_range_stmt(lbProcedure *p, AstRangeStmt *rs, Scope *sc
 			switch (addr.kind) {
 			case lbAddr_Swizzle:
 			case lbAddr_SwizzleLarge:
+			case lbAddr_SwizzleSoa:
 				// NOTE(laytan): apply the swizzle.
 				array = lb_address_from_load(p, lb_addr_load(p, addr));
 				break;
@@ -2201,7 +2202,9 @@ gb_internal void lb_build_type_switch_stmt(lbProcedure *p, AstTypeSwitchStmt *ss
 	LLVMValueRef switch_instr = nullptr;
 	if (type_size_of(parent_base_type) == 0) {
 		GB_ASSERT(tag.value == nullptr);
-		switch_instr = LLVMBuildSwitch(p->builder, lb_const_bool(p->module, t_llvm_bool, false).value, else_block->block, cast(unsigned)num_cases);
+		GB_ASSERT(switch_kind == TypeSwitch_Union); // zero size only possible for union{}
+		Type *ut = type_deref(parent.type);
+		switch_instr = LLVMBuildSwitch(p->builder, lb_const_int(m, union_tag_type(ut), 0).value, else_block->block, cast(unsigned)num_cases);
 	} else {
 		GB_ASSERT(tag.value != nullptr);
 		switch_instr = LLVMBuildSwitch(p->builder, tag.value, else_block->block, cast(unsigned)num_cases);
@@ -2998,6 +3001,50 @@ gb_internal void lb_build_assign_stmt_array(lbProcedure *p, TokenKind op, lbAddr
 
 		for (i32 i = 0; i < index_count; i++) {
 			lhs_ptrs[i] = lb_emit_array_epi(p, lhs.addr, indices[i]);
+		}
+		for (i32 i = 0; i < index_count; i++) {
+			x_loads[i] = lb_emit_load(p, lhs_ptrs[i]);
+		}
+		for (i32 i = 0; i < index_count; i++) {
+			y_loads[i].value = LLVMBuildExtractValue(p->builder, rhs.value, i, "");
+			y_loads[i].type = elem_type;
+		}
+		for (i32 i = 0; i < index_count; i++) {
+			ops[i] = lb_emit_arith(p, op, x_loads[i], y_loads[i], elem_type);
+		}
+		for (i32 i = 0; i < index_count; i++) {
+			lb_emit_store(p, lhs_ptrs[i], ops[i]);
+		}
+		return;
+	} else if (lhs.kind == lbAddr_SwizzleSoa) {
+		// the three cases largely mirror each other,
+		// perhaps unify them?
+		GB_ASSERT(is_type_array(lhs_type));
+
+		// the index list may repeat components (and so be longer than 4), but the
+		// element array itself has at most 4, so distinct destinations do fit in [4];
+		// each dest is done on the first occurrence
+		bool indices_handled[4] = {};
+		i32 indices[4] = {};
+		i32 index_count = 0;
+		for (i32 index : lhs.swizzle_soa.indices) {
+			GB_ASSERT(index < 4);
+			if (indices_handled[index]) {
+				continue;
+			}
+			indices_handled[index] = true;
+			indices[index_count++] = index;
+		}
+
+		lb_emit_soa_index_bounds_check(p, lhs.addr, lhs.swizzle_soa.index, lhs.swizzle_soa.index_expr);
+
+		lbValue lhs_ptrs[4] = {};
+		lbValue x_loads[4]  = {};
+		lbValue y_loads[4]  = {};
+		lbValue ops[4]      = {};
+
+		for (i32 i = 0; i < index_count; i++) {
+			lhs_ptrs[i] = lb_soa_field_elem_ptr(p, lhs.addr, indices[i], lhs.swizzle_soa.index);
 		}
 		for (i32 i = 0; i < index_count; i++) {
 			x_loads[i] = lb_emit_load(p, lhs_ptrs[i]);

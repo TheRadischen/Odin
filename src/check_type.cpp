@@ -1764,7 +1764,10 @@ gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_
 			check_assignment(ctx, &o, in_type, str_lit("parameter value"));
 		}
 	} else {
-		if (in_type) {
+		expr = unparen_expr(expr);
+		if (expr && expr->kind == Ast_Uninit) {
+			error(expr, "Default parameter cannot be ---");
+		} else if (in_type) {
 			check_expr_with_type_hint(ctx, &o, expr, in_type);
 		} else {
 			check_expr(ctx, &o, expr);
@@ -1788,6 +1791,7 @@ gb_internal ParameterValue handle_parameter_value(CheckerContext *ctx, Type *in_
 					if (e->kind == Entity_Procedure) {
 						param_value.kind = ParameterValue_Constant;
 						param_value.value = exact_value_procedure(e->identifier);
+						param_value.proc_entity = e;
 						add_entity_use(ctx, e->identifier, e);
 					} else {
 						if (e->flags & EntityFlag_Param) {
@@ -2140,8 +2144,12 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 						// This is just to add the error message to determine_type_from_polymorphic which
 						// depends on valid position information
 						op.expr = _params;
-						op.mode = Addressing_Invalid;
-						op.type = t_invalid;
+
+						// NOTE(taylbr): Can still have valid type with null expr. Needed for resolving
+						if (op.mode == Addressing_Invalid || op.type == nullptr) {
+							op.mode = Addressing_Invalid;
+							op.type = t_invalid;
+						}
 					}
 					if (is_type_polymorphic_type) {
 						type = determine_type_from_polymorphic(ctx, type, op);
@@ -2174,6 +2182,10 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 						if (!valid) {
 							if (op.mode == Addressing_Constant) {
 								poly_const = op.value;
+								if (poly_const.kind == ExactValue_Integer && is_type_float(type)) {
+									poly_const.kind = ExactValue_Float;
+									poly_const.value_float = big_int_to_f64(&poly_const.value_integer);
+								}
 							} else {
 								if (!ctx->in_proc_group) {
 									error(op.expr, "Expected a constant value for this polymorphic name parameter, got %s", expr_to_string(op.expr));
@@ -2221,8 +2233,13 @@ gb_internal Type *check_get_params(CheckerContext *ctx, Scope *scope, Ast *_para
 				}
 
 				if (p->flags&FieldFlag_no_alias) {
-					if (!is_type_pointer(type) && !is_type_multi_pointer(type)) {
-						error(name, "'#no_alias' can only be applied pointer or multi-pointer typed parameters");
+					// If type == t_invalid, we either already errored (and erroring again here is just log
+					// noise) or we are rejecting a polymorphic proc group overload candidate.
+					// If no_polymorphic_errors is set, we are speculatively checking a candidate and
+					// erroring+stripping is premature: the chosen candidate will be re-checked with errors enabled,
+					// so a true error isn't lost.
+					if (type != t_invalid && !is_type_internally_pointer_like(type) && !ctx->no_polymorphic_errors) {
+						error(name, "'#no_alias' can only be applied to pointer-like type parameters");
 						p->flags &= ~FieldFlag_no_alias; // Remove the flag
 					}
 				}
@@ -2829,9 +2846,14 @@ gb_internal i64 check_array_count(CheckerContext *ctx, Operand *o, Ast *e) {
 	}
 	Type *type = core_type(o->type);
 	if (is_type_untyped(type) || is_type_integer(type)) {
-		if (o->value.kind == ExactValue_Integer) {
-			BigInt count = o->value.value_integer;
-			if (big_int_is_neg(&o->value.value_integer)) {
+		ExactValue value = o->value;
+		if (value.kind == ExactValue_Float) {
+			// NOTE: an integral float is a valid count, but it must be range checked as an integer
+			value = exact_value_to_integer(value);
+		}
+		if (value.kind == ExactValue_Integer) {
+			BigInt count = value.value_integer;
+			if (big_int_is_neg(&count)) {
 				gbAllocator a = heap_allocator();
 				String str = big_int_to_string(a, &count);
 				error(e, "Invalid negative array count, %.*s", LIT(str));
@@ -2847,12 +2869,6 @@ gb_internal i64 check_array_count(CheckerContext *ctx, Operand *o, Ast *e) {
 			error(e, "Array count too large, %.*s", LIT(str));
 			gb_free(a, str.text);
 			return 0;
-		} else if (o->value.kind == ExactValue_Float) {
-			u64 u = cast(u64)o->value.value_float;
-			f64 f = cast(f64)u;
-			if (f == o->value.value_float) {
-				return u;
-			}
 		}
 	}
 
@@ -3068,6 +3084,10 @@ gb_internal void check_map_type(CheckerContext *ctx, Type *type, Ast *node) {
 
 	init_core_map_type(ctx->checker);
 	init_map_internal_types(type);
+
+	if (build_context.bedrock) {
+		error(node, "'map' is not a valid type when using '-bedrock'");
+	}
 }
 
 gb_internal void check_matrix_type(CheckerContext *ctx, Type **type, Ast *node) {
@@ -3105,14 +3125,14 @@ gb_internal void check_matrix_type(CheckerContext *ctx, Type **type, Ast *node) 
 			error(node, "Invalid matrix column count, got nothing");
 		} else {
 			gbString s = expr_to_string(column.expr);
-			error(column.expr, "Invalid matrix column count, expected %d+ rows, got %s", MATRIX_ELEMENT_COUNT_MIN, s);
+			error(column.expr, "Invalid matrix column count, expected %d+ columns, got %s", MATRIX_ELEMENT_COUNT_MIN, s);
 			gb_string_free(s);
 		}
 	}
 	
 	if ((generic_row == nullptr && generic_column == nullptr) && row_count*column_count > MATRIX_ELEMENT_COUNT_MAX) {
 		i64 element_count = row_count*column_count;
-		error(column.expr, "Matrix types are limited to a maximum of %d elements, got %lld", MATRIX_ELEMENT_COUNT_MAX, cast(long long)element_count);
+		error(node, "Matrix types are limited to a maximum of %d elements, got %lld", MATRIX_ELEMENT_COUNT_MAX, cast(long long)element_count);
 	}
 
 
@@ -3807,6 +3827,7 @@ gb_internal bool check_type_internal(CheckerContext *ctx, Ast *e, Type **type, T
 			*type = alloc_type_dynamic_array(elem);
 		}
 		set_base_type(named_type, *type);
+
 		return true;
 	case_end;
 

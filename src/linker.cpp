@@ -13,6 +13,7 @@ struct LinkerData {
 gb_internal i32 system_exec_command_line_app(char const *name, char const *fmt, ...);
 gb_internal bool system_exec_command_line_app_output(char const *command, gbString *output);
 
+// No longer required not that LLVM 14 is removed(?)
 gb_internal void linker_enable_system_library_linking(LinkerData *ld) {
 	ld->needs_system_library_linked = true;
 }
@@ -154,7 +155,7 @@ try_cross_linking:;
 		String section_name = str_lit("msvc-link");
 		bool is_windows = build_context.metrics.os == TargetOs_windows;
 	#else
-		String section_name = str_lit("lld-link");
+		String section_name = str_lit("ld-link");
 		bool is_windows = false;
 	#endif
 

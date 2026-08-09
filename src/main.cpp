@@ -178,12 +178,91 @@ gb_internal i32 system_exec_command_line_app(char const *name, char const *fmt, 
 	return exit_code;
 }
 
-gb_internal void system_must_exec_command_line_app(char const *name, char const *fmt, ...) {
-	va_list va;
-	va_start(va, fmt);
-	system_exec_command_line_app_internal(/* exit_on_err= */ true, name, fmt, va);
-	va_end(va);
+#if !defined(GB_SYSTEM_WINDOWS)
+#include <spawn.h>
+extern char **environ;
+#endif
+
+#if defined(GB_SYSTEM_WINDOWS)
+int run_subprocess(String const &exe_name, wchar_t *after_double_dash_raw) {
+	gbAllocator a = heap_allocator();
+
+	String16 wexe_name = string_to_string16(a, exe_name);
+	defer (gb_free(a, wexe_name.text));
+
+	isize args_len = 0;
+	if (after_double_dash_raw) {
+		args_len = string16_len(cast(u16 *)after_double_dash_raw);
+	}
+
+	isize cmd_len = wexe_name.len + 2;
+	if (args_len > 0) cmd_len += args_len + 1;
+
+	wchar_t *cmd_line = gb_alloc_array(a, wchar_t, cmd_len + 1);
+	defer (gb_free(a, cmd_line));
+
+	isize n = 0;
+	cmd_line[n++] = '"';
+	gb_memmove(cmd_line + n, wexe_name.text, wexe_name.len * gb_size_of(wchar_t));
+	n += wexe_name.len;
+	cmd_line[n++] = '"';
+	if (args_len > 0) {
+		cmd_line[n++] = ' ';
+		gb_memmove(cmd_line + n, after_double_dash_raw, args_len * gb_size_of(wchar_t));
+		n += args_len;
+	}
+	cmd_line[n] = '\0';
+
+	STARTUPINFOW start_info = {gb_size_of(STARTUPINFOW)};
+	PROCESS_INFORMATION pi = {0};
+	int exit_code = 0;
+
+	if (CreateProcessW(nullptr, cmd_line,
+	                   nullptr, nullptr, true, 0, nullptr, nullptr,
+	                   &start_info, &pi)) {
+		WaitForSingleObject(pi.hProcess, INFINITE);
+		GetExitCodeProcess(pi.hProcess, cast(DWORD *)&exit_code);
+
+		CloseHandle(pi.hProcess);
+		CloseHandle(pi.hThread);
+	} else {
+		String cmd_line_utf8 = string16_to_string(a, make_string16(cast(u16 *)cmd_line, n));
+		gb_printf_err("Failed to execute command:\n\t%.*s\n", LIT(cmd_line_utf8));
+		gb_free(a, cmd_line_utf8.text);
+		exit_code = -1;
+	}
+	return exit_code;
 }
+#else
+int run_subprocess(const char *name, const char **args) {
+	pid_t pid;
+	int status;
+	status = posix_spawn(&pid, name, NULL, NULL, (char *const *)args, environ);
+	if (status != 0) {
+		gb_printf_err("Could not spawn subprocess: %s\n", strerror(errno));
+		return -1;
+	}
+
+	for (;;) {
+		if (waitpid(pid, &status, WUNTRACED) < 0) {
+			gb_printf_err("Could not wait on subprocess: (pid: %d): %s\n", pid, strerror(errno));
+			return -1;
+		}
+
+		if (WIFEXITED(status)) {
+			return WEXITSTATUS(status);
+		} else if (WIFSIGNALED(status)) {
+			struct rlimit limit = { 0, 0, };
+			setrlimit(RLIMIT_CORE, &limit);
+			raise(WTERMSIG(status));
+			return -1;
+		} else if (WIFSTOPPED(status)) {
+			return -1;
+		}
+	}
+	GB_PANIC("Subprocess failure");
+}
+#endif
 
 #if defined(GB_SYSTEM_WINDOWS)
 #define popen _popen
@@ -217,12 +296,12 @@ gb_internal bool system_exec_command_line_app_output(char const *command, gbStri
 	return true;
 }
 
-gb_internal Array<String> setup_args(int argc, char const **argv) {
+gb_internal Array<String> setup_args(int argc, char const **argv, isize *double_dash_pos, wchar_t **after_double_dash_raw) {
 	gbAllocator a = heap_allocator();
 
 #if defined(GB_SYSTEM_WINDOWS)
 	int wargc = 0;
-	wchar_t **wargv = command_line_to_wargv(GetCommandLineW(), &wargc);
+	wchar_t **wargv = command_line_to_wargv(GetCommandLineW(), &wargc, double_dash_pos, after_double_dash_raw);
 	auto args = array_make<String>(a, 0, wargc);
 	for (isize i = 0; i < wargc; i++) {
 		u16 *warg = cast(u16 *)wargv[i];
@@ -231,6 +310,8 @@ gb_internal Array<String> setup_args(int argc, char const **argv) {
 		String arg = string16_to_string(a, wstr);
 		if (arg.len > 0) {
 			array_add(&args, arg);
+		} else if (double_dash_pos && *double_dash_pos > 0 && args.count < *double_dash_pos) {
+			*double_dash_pos -= 1;
 		}
 	}
 	return args;
@@ -312,6 +393,7 @@ enum BuildFlagKind {
 	BuildFlag_Debug,
 	BuildFlag_DisableAssert,
 	BuildFlag_NoBoundsCheck,
+	BuildFlag_WebkitSwitchWorkaround,
 	BuildFlag_NoTypeAssert,
 	BuildFlag_NoDynamicLiterals,
 	BuildFlag_DynamicLiterals,
@@ -354,6 +436,7 @@ enum BuildFlagKind {
 	BuildFlag_NoThreadLocal,
 
 	BuildFlag_RelocMode,
+	BuildFlag_StackProtector,
 	BuildFlag_DisableRedZone,
 
 	BuildFlag_DisableUnwind,
@@ -393,6 +476,10 @@ enum BuildFlagKind {
 	BuildFlag_IntegerDivisionByZero,
 
 	BuildFlag_BuildDiagnostics,
+
+	BuildFlag_Bedrock,
+	BuildFlag_DisableNonConstantGlobals,
+	BuildFlag_DisableInitFini,
 
 	// internal use only
 	BuildFlag_InternalFastISel,
@@ -450,6 +537,27 @@ gb_internal void add_flag(Array<BuildFlag> *build_flags, BuildFlagKind kind, Str
 	array_add(build_flags, flag);
 }
 
+// A value such as `1e-5` is a float, not an integer. Base prefixed literals are excluded because
+// `e` is a valid digit in bases 16 and above, e.g. `0x1e`.
+gb_internal bool build_param_looks_like_float(String const &param) {
+	if (string_contains_char(param, '.')) {
+		return true;
+	}
+	isize i = 0;
+	if (param.len > 0 && (param[0] == '-' || param[0] == '+')) {
+		i = 1;
+	}
+	if (param.len > i+1 && param[i] == '0' && !gb_char_is_digit(cast(char)param[i+1])) {
+		return false;
+	}
+	for (; i < param.len; i++) {
+		if (param[i] == 'e' || param[i] == 'E') {
+			return true;
+		}
+	}
+	return false;
+}
+
 gb_internal ExactValue build_param_to_exact_value(String name, String param) {
 	ExactValue value = {};
 
@@ -475,7 +583,7 @@ gb_internal ExactValue build_param_to_exact_value(String name, String param) {
 		Try to parse as an integer or float
 	*/
 	if (param[0] == '-' || param[0] == '+' || gb_is_between(param[0], '0', '9')) {
-		if (string_contains_char(param, '.')) {
+		if (build_param_looks_like_float(param)) {
 			value = exact_value_float_from_string(param);
 		} else {
 			value = exact_value_integer_from_string(param);
@@ -545,6 +653,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_Debug,                   str_lit("debug"),                     BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_DisableAssert,           str_lit("disable-assert"),            BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_NoBoundsCheck,           str_lit("no-bounds-check"),           BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_WebkitSwitchWorkaround,  str_lit("webkit-switch-workaround"),  BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_NoTypeAssert,            str_lit("no-type-assert"),            BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_NoThreadLocal,           str_lit("no-thread-local"),           BuildFlagParam_None,    Command__does_check);
 	add_flag(&build_flags, BuildFlag_NoDynamicLiterals,       str_lit("no-dynamic-literals"),       BuildFlagParam_None,    Command__does_check);
@@ -587,6 +696,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_MinimumOSVersion,        str_lit("minimum-os-version"),        BuildFlagParam_String,  Command__does_build | Command_bundle_android);
 
 	add_flag(&build_flags, BuildFlag_RelocMode,               str_lit("reloc-mode"),                BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_StackProtector,          str_lit("stack-protector"),           BuildFlagParam_String,  Command__does_build);
 	add_flag(&build_flags, BuildFlag_DisableRedZone,          str_lit("disable-red-zone"),          BuildFlagParam_None,    Command__does_build);
 
 	add_flag(&build_flags, BuildFlag_DisableUnwind,           str_lit("disable-unwind"),          BuildFlagParam_None,    Command__does_build);
@@ -626,6 +736,10 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_IntegerDivisionByZero,   str_lit("integer-division-by-zero"),  BuildFlagParam_String, Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_BuildDiagnostics,        str_lit("build-diagnostics"),         BuildFlagParam_None,    Command__does_build);
+
+	add_flag(&build_flags, BuildFlag_Bedrock,                 str_lit("bedrock"),                   BuildFlagParam_None,    Command__does_check);
+	add_flag(&build_flags, BuildFlag_DisableNonConstantGlobals, str_lit("disable-non-constant-globals"), BuildFlagParam_None, Command__does_check);
+	add_flag(&build_flags, BuildFlag_DisableInitFini,         str_lit("disable-init-fini"),         BuildFlagParam_None,    Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_InternalFastISel,        str_lit("internal-fast-isel"),        BuildFlagParam_None,    Command_all);
 	add_flag(&build_flags, BuildFlag_InternalIgnoreLazy,      str_lit("internal-ignore-lazy"),      BuildFlagParam_None,    Command_all);
@@ -830,7 +944,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							} else if (value.value_string == "speed") {
 								build_context.custom_optimization_level = true;
 								build_context.optimization_level = 2;
-							} else if (value.value_string == "aggressive" && LB_USE_NEW_PASS_SYSTEM) {
+							} else if (value.value_string == "aggressive") {
 								build_context.custom_optimization_level = true;
 								build_context.optimization_level = 3;
 							} else {
@@ -839,9 +953,7 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								gb_printf_err("\tminimal\n");
 								gb_printf_err("\tsize\n");
 								gb_printf_err("\tspeed\n");
-								if (LB_USE_NEW_PASS_SYSTEM) {
-									gb_printf_err("\taggressive\n");
-								}
+								gb_printf_err("\taggressive\n");
 								gb_printf_err("\tnone (useful for -debug builds)\n");
 								bad_flags = true;
 							}
@@ -1154,8 +1266,10 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								bool found = false;
 
 								if (selected_target_metrics->metrics->os != TargetOs_darwin &&
-								    selected_target_metrics->metrics->os != TargetOs_linux ) {
-									gb_printf_err("-subtarget can only be used with darwin and linux based targets at the moment\n");
+										selected_target_metrics->metrics->os != TargetOs_linux &&
+									 (selected_target_metrics->metrics->os != TargetOs_freestanding ||
+										selected_target_metrics->metrics->arch != TargetArch_arm32)) {
+									gb_printf_err("-subtarget can only be used with darwin, linux or freestanding_arm32 based targets at the moment\n");
 									bad_flags = true;
 									break;
 								}
@@ -1234,6 +1348,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							break;
 						case BuildFlag_NoBoundsCheck:
 							build_context.no_bounds_check = true;
+							break;
+						case BuildFlag_WebkitSwitchWorkaround:
+							build_context.webkit_switch_workaround = true;
 							break;
 						case BuildFlag_NoTypeAssert:
 							build_context.no_type_assert = true;
@@ -1431,6 +1548,26 @@ gb_internal bool parse_build_flags(Array<String> args) {
 
 							break;
 						}
+						case BuildFlag_StackProtector: {
+							GB_ASSERT(value.kind == ExactValue_String);
+							String v = value.value_string;
+							if (v == "none") {
+								build_context.stack_protector = StackProtector_None;
+							} else if (v == "base") {
+								build_context.stack_protector = StackProtector_Ssp;
+							} else if (v == "all") {
+								build_context.stack_protector = StackProtector_SspReq;
+							} else if (v == "strong") {
+								build_context.stack_protector = StackProtector_SspStrong;
+							} else {
+								gb_printf_err("-stack-protector flag expected one of the following\n");
+								gb_printf_err("\tnone\n");
+								gb_printf_err("\tbase\n");
+								gb_printf_err("\tall\n");
+								gb_printf_err("\tstrong\n");
+								bad_flags = true;
+							}
+						}
 						case BuildFlag_DisableRedZone:
 							build_context.disable_red_zone = true;
 							break;
@@ -1597,6 +1734,20 @@ gb_internal bool parse_build_flags(Array<String> args) {
 
 						case BuildFlag_BuildDiagnostics:
 							build_context.build_diagnostics = true;
+							break;
+
+						case BuildFlag_Bedrock:
+							build_context.bedrock = true;
+							build_context.no_rtti = true;
+							build_context.disable_non_constant_globals = true;
+							build_context.disable_init_fini = true;
+							break;
+
+						case BuildFlag_DisableNonConstantGlobals:
+							build_context.disable_non_constant_globals = true;
+							break;
+						case BuildFlag_DisableInitFini:
+							build_context.disable_init_fini = true;
 							break;
 
 						case BuildFlag_InternalFastISel:
@@ -2625,6 +2776,19 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		}
 	}
 
+	if (check) {
+		if (print_flag("-bedrock")) {
+			print_usage_line(2, "Disables numerous features. List of disabled features:");
+			print_usage_line(3, "`map` types");
+			print_usage_line(3, "128-bit integer types");
+			print_usage_line(3, "runtime type information (-no-rtti)");
+			print_usage_line(3, "non-constant global variables (-disable-non-constant-globals)");
+			print_usage_line(3, "@(init) @(fini) (-disable-init-fini)");
+			print_usage_line(3, "Anything Objective-C related");
+			print_usage_line(3, "The default paths to the library collections 'core' and 'vendor'");
+		}
+	}
+
 	if (build) {
 		if (print_flag("-build-mode:<mode>")) {
 			print_usage_line(2, "Sets the build mode.");
@@ -2648,10 +2812,11 @@ gb_internal int print_show_help(String const arg0, String command, String option
 
 	if (check) {
 		if (print_flag("-collection:<name>=<filepath>")) {
-			print_usage_line(2, "Defines a library collection used for imports.");
+			print_usage_line(2, "Defines a library collection used for imports and foreign imports.");
 			print_usage_line(2, "Example: -collection:shared=dir/to/shared");
 			print_usage_line(2, "Usage in Code:");
 				print_usage_line(3, "import \"shared:foo\"");
+				print_usage_line(3, "foreign import lib \"shared:libfoo.a\"");
 		}
 
 		if (print_flag("-custom-attribute:<string>")) {
@@ -2691,7 +2856,15 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		if (print_flag("-disable-assert")) {
 			print_usage_line(2, "Disables the code generation of the built-in run-time 'assert' procedure, and defines the global constant ODIN_DISABLE_ASSERT to be 'true'.");
 		}
+	}
 
+	if (check) {
+		if (print_flag("-disable-init-fini")) {
+			print_usage_line(2, "Disables the ability to use @(init) and @(fini) procedures");
+		}
+	}
+
+	if (run_or_build) {
 		if (print_flag("-disable-red-zone")) {
 			print_usage_line(2, "Disables red zone on a supported freestanding target.");
 		}
@@ -2701,7 +2874,12 @@ gb_internal int print_show_help(String const arg0, String command, String option
 		if (print_flag("-disallow-do")) {
 			print_usage_line(2, "Disallows the 'do' keyword in the project.");
 		}
+
+		if (print_flag("-disable-non-constant-globals")) {
+			print_usage_line(2, "Disables any global variables which are not initialized with global constants");
+		}
 	}
+
 
 	if (doc) {
 		if (print_flag("-doc-format")) {
@@ -2891,6 +3069,11 @@ gb_internal int print_show_help(String const arg0, String command, String option
 			print_usage_line(2, "Disables bounds checking program wide.");
 		}
 
+		if (print_flag("-webkit-switch-workaround")) {
+			print_usage_line(2, "Constrains 'typeid' values to 63 bits to avoid an OMG JIT crash in WebKit when running WASM builds.");
+			print_usage_line(2, "Only needed for 'js_wasm32'/'js_wasm64p32' targets run in Safari/WebKit. See: https://github.com/odin-lang/Odin/issues/6810");
+		}
+
 		if (print_flag("-no-crt")) {
 			print_usage_line(2, "Disables automatic linking with the C Run Time.");
 		}
@@ -2928,9 +3111,7 @@ gb_internal int print_show_help(String const arg0, String command, String option
 				print_usage_line(3, "-o:minimal");
 				print_usage_line(3, "-o:size");
 				print_usage_line(3, "-o:speed");
-			if (LB_USE_NEW_PASS_SYSTEM) {
 				print_usage_line(3, "-o:aggressive (use this with caution)");
-			}
 			print_usage_line(2, "The default is -o:minimal. If -debug is set, the default is -o:none.");
 		}
 
@@ -2984,6 +3165,15 @@ gb_internal int print_show_help(String const arg0, String command, String option
 				print_usage_line(3, "-reloc-mode:static");
 				print_usage_line(3, "-reloc-mode:pic");
 				print_usage_line(3, "-reloc-mode:dynamic-no-pic");
+		}
+
+		if (print_flag("-stack-protector:<string>")) {
+			print_usage_line(2, "Specifies the stack protector.");
+			print_usage_line(2, "Available options:");
+				print_usage_line(3, "-stack-protector:none");
+				print_usage_line(3, "-stack-protector:base");
+				print_usage_line(3, "-stack-protector:all");
+				print_usage_line(3, "-stack-protector:strong");
 		}
 
 	#if defined(GB_SYSTEM_WINDOWS)
@@ -3079,7 +3269,7 @@ gb_internal int print_show_help(String const arg0, String command, String option
 
 	if (build) {
 		if (print_flag("-subtarget:<subtarget>")) {
-			print_usage_line(2, "[Darwin and Linux only]");
+			print_usage_line(2, "[Darwin, Linux and Freestanding ARM32 only]");
 			print_usage_line(2, "Available subtargets:");
 			String prefix = str_lit("-subtarget:");
 			for (u32 i = 1; i < Subtarget_COUNT; i++) {
@@ -3520,6 +3710,32 @@ gb_internal int strip_semicolons(Parser *parser) {
 	return cast(int)failed;
 }
 
+gb_internal void setup_bedrock_mode(void) {
+	if (!build_context.bedrock) {
+		return;
+	}
+
+	bool seen_core = false;
+	bool seen_vendor = false;
+	for (isize i = 0; i < library_collections.count; /**/) {
+		if (!seen_core && library_collections[i].name == "core") {
+			array_ordered_remove(&library_collections, i);
+			seen_core = true;
+			continue;
+		}
+
+		if (!seen_vendor && library_collections[i].name == "vendor") {
+			array_ordered_remove(&library_collections, i);
+			seen_vendor = true;
+			continue;
+		}
+
+		i += 1;
+	}
+
+	build_context.ODIN_DEFAULT_TO_NIL_ALLOCATOR = true;
+}
+
 gb_internal void init_terminal(void) {
 	TIME_SECTION("init terminal");
 	build_context.has_ansi_terminal_colours = false;
@@ -3610,20 +3826,52 @@ int main(int arg_count, char const **arg_ptr) {
 	
 	init_build_context_error_pos_style();
 
-	Array<String> args = setup_args(arg_count, arg_ptr);
+	isize double_dash_pos = -1;
+	wchar_t *after_double_dash_raw = nullptr;
+	Array<String> args = setup_args(arg_count, arg_ptr, &double_dash_pos, &after_double_dash_raw);
+#if !defined(GB_SYSTEM_WINDOWS)
+	Array<String> run_args = array_make<String>(heap_allocator(), 0, arg_count);
+	defer (array_free(&run_args));
+#endif
 
 	String command = args[1];
 	String init_filename = {};
-	String run_args_string = {};
 	isize  last_non_run_arg = args.count;
 
 	for_array(i, args) {
 		if (args[i] == "--") {
+#if defined(GB_SYSTEM_WINDOWS)
+			GB_ASSERT(double_dash_pos == i);
+#endif
+			double_dash_pos = i;
 			break;
 		}
+
 		if (args[i] == "-help" || args[i] == "--help") {
 			build_context.show_help = true;
 			return print_show_help(args[0], command);
+		}
+	}
+
+	if (args.count > 2) {
+		// NOTE(bill): Allow for both `odin command path -flags` and `odin command -flags path`
+		// To do this, if the first argument after the command and last argument is NOT a flag,
+		// then put that last parameter first
+		isize end_arg = double_dash_pos >= 0 ? double_dash_pos : args.count-1;
+		if (args[1] == "bundle" && args.count > 4) {
+			if (string_starts_with(args[3], str_lit("-")) &&
+			    !string_starts_with(args[end_arg], str_lit("-"))) {
+				String possible_path = args[end_arg];
+				array_ordered_remove(&args, end_arg);
+				array_inject_at(&args, 3, possible_path);
+			}
+		} else if (args.count > 3) {
+			if (string_starts_with(args[2], str_lit("-")) &&
+			    !string_starts_with(args[end_arg], str_lit("-"))) {
+				String possible_path = args[end_arg];
+				array_ordered_remove(&args, end_arg);
+				array_inject_at(&args, 2, possible_path);
+			}
 		}
 	}
 
@@ -3638,31 +3886,22 @@ int main(int arg_count, char const **arg_ptr) {
 			build_context.command_kind = Command_test;
 		}
 
-		Array<String> run_args = array_make<String>(heap_allocator(), 0, arg_count);
-		defer (array_free(&run_args));
+		if (double_dash_pos != -1) {
+			last_non_run_arg = double_dash_pos;
 
-		isize run_args_start_idx = -1;
-		for_array(i, args) {
-			if (args[i] == "--") {
-				run_args_start_idx = i;
-				break;
-			}
-		}
-		if (run_args_start_idx != -1) {
-			last_non_run_arg = run_args_start_idx;
-
-			if (run_args_start_idx == 2) {
+			if (double_dash_pos == 2) {
 				// missing src path on argv[2], invocation: odin [run|test] --
 				usage(args[0]);
 				return 1;
 			}
 
-			for(isize i = run_args_start_idx+1; i < args.count; ++i) {
+#if !defined(GB_SYSTEM_WINDOWS)
+			for(isize i = double_dash_pos+1; i < args.count; ++i) {
 				array_add(&run_args, args[i]);
 			}
+#endif
 		}
 		args = array_slice(args, 0, last_non_run_arg);
-		run_args_string = string_join_and_quote(heap_allocator(), run_args);
 
 		init_filename = args[2];
 		run_output = true;
@@ -3770,6 +4009,10 @@ int main(int arg_count, char const **arg_ptr) {
 			usage(args[0]);
 			return 1;
 		}
+		// NOTE(Jeroen): `odin root` omits a newline on purpose so that it can be used in scripts.
+		//               e.g. `ODIN_CORE="$(odin root)core"`.
+		//               Human convenience is not a consideration.
+		//               Further pull requests to add a newline will be closed without comment.
 		gb_printf("%.*s", LIT(odin_root_dir()));
 		return 0;
 	} else if (command == "clear-cache") {
@@ -3796,6 +4039,10 @@ int main(int arg_count, char const **arg_ptr) {
 
 	if (build_context.show_help) {
 		return print_show_help(args[0], command);
+	}
+
+	if (build_context.bedrock) {
+		setup_bedrock_mode();
 	}
 
 	if (init_filename.len > 0 && !build_context.show_help) {
@@ -4040,12 +4287,6 @@ int main(int arg_count, char const **arg_ptr) {
 			gb_printf_err("missing required target feature: \"%.*s\", enable it by setting a different -microarch or explicitly adding it through -target-features\n", LIT(disabled));
 			gb_exit(1);
 		}
-
-		// NOTE(laytan): some weird errors on LLVM 14 that LLVM 17 fixes.
-		if (LLVM_VERSION_MAJOR < 17) {
-			gb_printf_err("Invalid LLVM version %s, RISC-V targets require at least LLVM 17\n", LLVM_VERSION_STRING);
-			gb_exit(1);
-		}
 	}
 
 	if (build_context.show_debug_messages) {
@@ -4251,8 +4492,27 @@ end_of_code_gen:;
 		String exe_name = path_to_string(heap_allocator(), build_context.build_paths[BuildPath_Output]);
 		defer (gb_free(heap_allocator(), exe_name.text));
 
-		system_must_exec_command_line_app("odin run", "\"%.*s\" %.*s", LIT(exe_name), LIT(run_args_string));
+#if defined(GB_SYSTEM_WINDOWS)
+		int subprocess_res = run_subprocess(exe_name, after_double_dash_raw);
+#else
+		const char* exe_name_cstring = alloc_cstring(heap_allocator(), exe_name);
+		Array<const char *> run_args_cstring = array_make<const char *>(heap_allocator(), 0, run_args.count);
+		defer({
+			for_array(i, run_args_cstring) { gb_free(heap_allocator(), (void*)run_args_cstring[i]);	}
+			array_free(&run_args_cstring);
+		});
 
+		array_add(&run_args_cstring, exe_name_cstring);
+		for_array(i, run_args) {
+			array_add(&run_args_cstring, alloc_cstring(heap_allocator(), run_args[i]));
+		}
+		array_add(&run_args_cstring, NULL);
+
+		int subprocess_res = run_subprocess(exe_name_cstring, run_args_cstring.data);
+#endif
+		if (subprocess_res) {
+			gb_exit(subprocess_res);
+		}
 		if (!build_context.keep_executable) {
 			char const *filename = cast(char const *)exe_name.text;
 			gb_file_remove(filename);
